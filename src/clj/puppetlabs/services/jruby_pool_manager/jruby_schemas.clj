@@ -3,8 +3,7 @@
   (:import (clojure.lang Atom Agent IFn PersistentArrayMap PersistentHashMap)
            (com.puppetlabs.jruby_utils.pool LockablePool)
            (org.jruby Main Main$Status RubyInstanceConfig)
-           (com.puppetlabs.jruby_utils.jruby ScriptingContainer)
-           (org.jruby.runtime Constants)))
+           (com.puppetlabs.jruby_utils.jruby ScriptingContainer)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Schemas
@@ -101,7 +100,8 @@
 (def PoolState
   "A map that describes all attributes of a particular JRuby pool."
   {:pool         pool-queue-type
-   :size schema/Int})
+   :size schema/Int
+   :flush-pending schema/Bool})
 
 (def PoolStateContainer
   "An atom containing the current state of all of the JRuby pool."
@@ -109,17 +109,27 @@
                      (nil? (schema/check PoolState @%)))
                'PoolStateContainer))
 
+(def PoolContextInternal
+  "The data structure that stores all JRuby pools"
+  {:modify-instance-agent JRubyPoolAgent
+   :pool-state PoolStateContainer
+   :event-callbacks Atom})
+
+(schema/defrecord ReferencePoolContext
+  [config :- JRubyConfig
+   internal :- PoolContextInternal])
+
+(schema/defrecord JRubyPoolContext
+  [config :- JRubyConfig
+   internal :- PoolContextInternal])
+
 (def PoolContext
-  "The data structure that stores all JRuby pools and the original configuration."
-  {:config JRubyConfig
-   :internal {:modify-instance-agent JRubyPoolAgent
-              :pool-state PoolStateContainer
-              :event-callbacks Atom}})
+  (schema/pred #(or (instance? ReferencePoolContext %)
+                    (instance? JRubyPoolContext %))))
 
 (def JRubyInstanceState
   "State metadata for an individual JRubyInstance"
-  {:borrow-count schema/Int
-   :flush-pending schema/Bool})
+  {:borrow-count schema/Int})
 
 (def JRubyInstanceStateContainer
   "An atom containing the current state of a given JRubyInstance."

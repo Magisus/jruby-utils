@@ -5,13 +5,18 @@
             [puppetlabs.kitchensink.core :as ks]
             [puppetlabs.services.jruby-pool-manager.jruby-schemas :as jruby-schemas]
             [puppetlabs.i18n.core :as i18n]
-            [slingshot.slingshot :as sling])
+            [slingshot.slingshot :as sling]
+            [puppetlabs.services.protocols.jruby-pool :as pool-protocol])
   (:import (clojure.lang IFn IDeref)
-           (puppetlabs.services.jruby_pool_manager.jruby_schemas PoisonPill JRubyInstance)
+           (puppetlabs.services.jruby_pool_manager.jruby_schemas PoisonPill
+                                                                 JRubyInstance
+                                                                 ReferencePoolContext
+                                                                 JRubyPoolContext)
            (java.util.concurrent TimeUnit TimeoutException)))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
 ;;; Private
+
 
 (schema/defn ^:always-validate
   next-instance-id :- schema/Int
@@ -44,30 +49,92 @@
     (send jruby-agent agent-fn)))
 
 (declare send-flush-instance!)
-(declare flush-and-repopulate-pool!)
 
-(schema/defn flush-reference-pool
-  [pool-context instance]
-  (let [instance-state (jruby-internal/get-instance-state-container instance)
+(schema/defn flush-reference-pool-instance!
+  [pool-context instance cleanup-fn]
+  (let [pool-state (jruby-internal/get-pool-state-container pool-context)
         pool (jruby-internal/get-pool pool-context)
+        config (:config pool-context)
         _ (.releaseItem pool instance)]
-    (when (not (:flush-pending instance-state))
+    (when (not (:flush-pending @pool-state))
       ;; trigger a flush of the Jruby pool if one hasn't already
       ;; been started
-      (do
-        (swap! instance-state update-in [:flush-pending] true)
-        (flush-and-repopulate-pool! pool-context)))))
+      (try
+        (do
+          (swap! pool-state assoc :flush-pending true)
+          (.lock pool)
+          (.clear pool)
+          (cleanup-fn instance)
+          (.terminate (:scripting-container instance))
+          (jruby-internal/create-pool-instance! pool 1 config
+                                                (partial send-flush-instance! pool-context)
+                                                (:splay-instance-flush config))
+          (log/info (i18n/trs "Finished creating JRubyInstance 1 of 1"))
+          (swap! pool-state assoc :flush-pending false)
+          (.unlock pool))
+        (catch Exception e
+         (.clear pool)
+         (jruby-internal/insert-poison-pill pool e)
+         (throw (IllegalStateException.
+                  (i18n/trs "There was a problem flushing and refilling the pool." e))))))))
 
-;; When `multithreaded` is true, we are using the ReferencePool,
-;; which must block on all references being returned to the pool
-;; before it can be flushed, rather than just flushing an individual
-;; instance immediately like we do with the JRubyPool.
-(schema/defn flush-instance-fn :- IFn
-  [multithreaded :- schema/Bool
-   pool-context :- jruby-schemas/PoolContext]
-  (if multithreaded
-    (partial flush-reference-pool pool-context)
-    (partial send-flush-instance! pool-context)))
+(schema/defn flush-reference-pool!
+  [pool-context
+   refill?
+   on-complete]
+  (let [pool-state (jruby-internal/get-pool-state-container pool-context)
+        pool (:pool (jruby-internal/get-pool-state pool-context))
+        cleanup-fn (get-in pool-context [:config :lifecycle :cleanup])]
+    (when (not (:flush-pending @pool-state))
+      (try
+        (swap! pool-state assoc :flush-pending true)
+        (.lock pool)
+        (let [instance (.borrowItem pool)]
+          (cleanup-fn instance)
+          (.terminate (:scripting-container instance))
+          (.releaseItem pool instance))
+        (.clear pool)
+        (when refill?
+          (jruby-internal/create-pool-instance! pool 1 (:config pool-context)
+                                                (partial send-flush-instance! pool-context)))
+        (log/info (i18n/trs "Finished creating JRubyInstance 1 of 1"))
+        (swap! pool-state assoc :flush-pending false)
+        (catch Exception e
+          (.clear pool)
+          (.unlock pool)
+          (jruby-internal/insert-poison-pill pool e)
+          (throw (IllegalStateException.
+                   (i18n/trs "There was a problem flushing the pool.")
+                   e)))
+        (finally
+          (.unlock pool)
+          (deliver on-complete true))))))
+
+
+(extend-type ReferencePoolContext
+  pool-protocol/JRubyPool
+  (clear-pool!
+    [this refill? on-complete]
+    (flush-reference-pool! this refill? on-complete))
+  (clear-instance!
+    [this instance cleanup-fn]
+    (flush-reference-pool-instance! this instance cleanup-fn)))
+
+(declare drain-and-refill-pool!)
+
+(extend-type JRubyPoolContext
+  pool-protocol/JRubyPool
+  (clear-pool!
+    [this refill? on-complete]
+    (drain-and-refill-pool! this refill? on-complete))
+  (clear-instance!
+    [this instance cleanup-fn]
+    (let [config (:config this)
+          pool (jruby-internal/get-pool this)
+          new-id (next-instance-id (:id instance) this)]
+      (jruby-internal/cleanup-pool-instance! instance cleanup-fn)
+      (jruby-internal/create-pool-instance! pool new-id config
+                                            (partial send-flush-instance! this)))))
 
 (schema/defn ^:always-validate
   prime-pool!
@@ -87,9 +154,7 @@
             (log/debug (i18n/trs "Priming JRubyInstance {0} of {1}"
                                   id count))
             (jruby-internal/create-pool-instance! pool id config
-                                                  (flush-instance-fn
-                                                    (:multithreaded config)
-                                                    pool-context)
+                                                  (partial send-flush-instance! pool-context)
                                                   (:splay-instance-flush config))
             (log/info (i18n/trs "Finished creating JRubyInstance {0} of {1}"
                                  id count)))))
@@ -107,16 +172,9 @@
   and insert it into the specified pool. Should only be called from
   the modify-instance-agent"
   [pool-context :- jruby-schemas/PoolContext
-   instance :- JRubyInstance
-   new-id :- schema/Int
-   config :- jruby-schemas/JRubyConfig]
-  (let [cleanup-fn (get-in pool-context [:config :lifecycle :cleanup])
-        pool (jruby-internal/get-pool pool-context)]
-    (jruby-internal/cleanup-pool-instance! instance cleanup-fn)
-    (jruby-internal/create-pool-instance! pool new-id config
-                                          (flush-instance-fn
-                                            (:multithreaded config)
-                                            pool-context))))
+   instance :- JRubyInstance]
+  (let [cleanup-fn (get-in pool-context [:config :lifecycle :cleanup])]
+    (pool-protocol/clear-instance! pool-context instance cleanup-fn)))
 
 (schema/defn borrow-all-jrubies*
   "The core logic for borrow-all-jrubies. Should only be called from borrow-all-jrubies"
@@ -184,12 +242,10 @@
         (jruby-internal/cleanup-pool-instance! old-instance cleanup-fn)
         (when refill?
           (jruby-internal/create-pool-instance! pool new-id config
-                                                (flush-instance-fn
-                                                  (:multithreaded config)
-                                                  pool-context)
+                                                (partial send-flush-instance! pool-context)
                                                 (:splay-instance-flush config))
           (log/info (i18n/trs "Finished creating JRubyInstance {0} of {1}"
-                               new-id instance-count)))
+                              new-id instance-count)))
         (catch Exception e
           (.clear pool)
           (jruby-internal/insert-poison-pill pool e)
@@ -239,7 +295,7 @@
   (let [pool-state (jruby-internal/get-pool-state pool-context)
         pool (:pool pool-state)
         on-complete (promise)]
-    (drain-and-refill-pool! pool-context false on-complete)
+    (pool-protocol/clear-pool! pool-context false on-complete)
     (jruby-internal/insert-shutdown-poison-pill pool)
     ; Wait for flush to complete
     @on-complete
@@ -274,7 +330,7 @@
   ;; are returned to the pool, which won't be done until sometimes after
   ;; this function exits
   (log/info (i18n/trs "Flush request received; flushing old JRuby instances."))
-  (drain-and-refill-pool! pool-context true))
+  (pool-protocol/clear-pool! pool-context true (promise)))
 
 (schema/defn ^:always-validate
   send-flush-instance! :- jruby-schemas/JRubyPoolAgent
@@ -283,7 +339,5 @@
    instance :- JRubyInstance]
   ;; We use an agent to syncronize jruby creation and destruction to mitigate
   ;; any possible race conditions in the underlying jruby scripting container
-  (let [{:keys [config]} pool-context
-        modify-instance-agent (get-modify-instance-agent pool-context)
-        id (next-instance-id (:id instance) pool-context)]
-    (send-agent modify-instance-agent #(flush-instance! pool-context instance id config))))
+  (let [modify-instance-agent (get-modify-instance-agent pool-context)]
+    (send-agent modify-instance-agent #(flush-instance! pool-context instance))))

@@ -11,14 +11,14 @@
 (defn create-empty-pool
   ([] (create-empty-pool 10))
   ([maxBorrows]
-    (ReferencePool. maxBorrows)))
+   (ReferencePool. maxBorrows)))
 
 (defn create-populated-pool
   ([] create-populated-pool 10)
   ([size]
-  (let [pool (create-empty-pool size)]
-      (.register pool (str "foo"))
-    pool)))
+   (let [pool (create-empty-pool size)]
+     (.register pool (str "foo"))
+     pool)))
 
 (defn borrow-n-instances
   [pool n]
@@ -36,21 +36,6 @@
       (.register pool "foo ok")
       (is (thrown? IllegalStateException
                    (.register pool "foo bar"))))))
-
-(deftest pool-unregister-from-pool-test
-  (testing "registered elements properly removed for"
-    (let [pool (create-populated-pool 3)
-          instances (borrow-n-instances pool 2)]
-      (testing "first unregister call should delete the instance"
-        (let [first-instance (first instances)
-              _ (.unregister pool first-instance)
-              registered-elements (.getRegisteredElements pool)]
-          (is (= 0 (.size registered-elements)))))
-      (testing "second unregister call should not error"
-        (let [second-instance (second instances)
-              _ (.unregister pool second-instance)
-              registered-elements (.getRegisteredElements pool)]
-          (is (= 0 (.size registered-elements))))))))
 
 (deftest pool-lock-is-blocking-until-borrows-returned-test
   (let [pool (create-populated-pool 3)
@@ -553,7 +538,7 @@
   (testing "when borrow is blocked, inserting a pill unblocks it"
     (let [pool (create-populated-pool 1)
           pill (str "I'm just a pill, yes I'm only a pill")
-          instance (.borrowItem pool)
+          _ (.borrowItem pool)
           blocked-borrow (future (.borrowItem pool))]
       (is (= 0 (.size pool)))
 
@@ -632,17 +617,18 @@
                  (.getMessage exception))))))))
 
 (deftest pool-clear-test
-  (testing (str "pool clear deletes the JRuby instance when there are no borrows")
+  (testing (str "clear blocks waiting for all references to be returned")
     (let [pool (create-populated-pool 2)
-          instance (.borrowItem pool)]
+          instance (.borrowItem pool)
+          cleared? (promise)
+          _ (future
+              (.clear pool)
+              (deliver cleared? true))]
       (is (= 1 (.size pool)))
-      (is (= 1 (.. pool getRegisteredElements size)))
-      (.clear pool)
-      (is (= 1 (.size pool)))
-      (is (= 1 (.. pool getRegisteredElements size)))
+      (is (= false (realized? cleared?)))
       (.releaseItem pool instance)
-      (.clear pool)
-      (is (= 0 (.. pool getRegisteredElements size))))))
+      (is (= true @cleared?))
+      (is (= 0 (.size pool))))))
 
 (deftest pool-remaining-capacity
   (testing "remaining capacity in pool correct per instances registered"

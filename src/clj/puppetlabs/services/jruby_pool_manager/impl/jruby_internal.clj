@@ -184,14 +184,16 @@
   the config input."
   [{maxBorrows :max-active-instances} :- jruby-schemas/JRubyConfig]
   {:pool (instantiate-reference-pool maxBorrows)
-   :size 1})
+   :size 1
+   :flush-pending false})
 
 (schema/defn ^:always-validate
   create-pool-from-config :- jruby-schemas/PoolState
   "Create a new PoolState based on the config input."
   [{size :max-active-instances} :- jruby-schemas/JRubyConfig]
   {:pool (instantiate-free-pool size)
-   :size size})
+   :size size
+   :flush-pending false})
 
 (schema/defn ^:always-validate
   cleanup-pool-instance!
@@ -258,7 +260,7 @@
                                      :max-borrows max-borrows-per-instance
                                      :initial-borrows initial-borrows
                                      :flush-instance-fn flush-instance-fn
-                                     :state (atom {:borrow-count 0 :flush-pending false})}})
+                                     :state (atom {:borrow-count 0})}})
               modified-instance (initialize-pool-instance-fn instance)]
           (.register pool modified-instance)
           modified-instance)))))
